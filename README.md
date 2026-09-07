@@ -23,7 +23,7 @@ Amphetamine keeps your Omarchy Linux system awake and prevents your laptop from 
 ### Via Omarchy Shell Plugin Manager (Recommended)
 
 ```bash
-omarchy plugin add https://github.com/ChaseC-130/omarchy-amphetamine.git --enable --yes
+omarchy plugin add https://github.com/ChaseC-130/amphetamine.git --enable --yes
 ```
 
 To move the widget across your bar:
@@ -35,7 +35,7 @@ omarchy bar move chase.amphetamine --section right
 
 Clone or link to your Omarchy plugins directory:
 ```bash
-ln -s ~/Code/omarchy-amphetamine ~/.config/omarchy/plugins/chase.amphetamine
+ln -s ~/Code/amphetamine ~/.config/omarchy/plugins/chase.amphetamine
 omarchy-shell shell rescanPlugins
 omarchy plugin enable chase.amphetamine
 ```
