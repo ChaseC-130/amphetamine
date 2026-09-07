@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+
+# Amphetamine for Omarchy
+# Prevents system sleep, idle screensaver, and lid-close suspend.
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/amphetamine"
+STATE_FILE="$STATE_DIR/state.json"
+OMARCHY_STAY_AWAKE="$HOME/.local/state/omarchy/indicators/stay-awake"
+
+mkdir -p "$STATE_DIR"
+
+notify() {
+  local title="$1"
+  local msg="$2"
+  notify-send -a "Amphetamine" -i "preferences-system-power" "$title" "$msg" 2>/dev/null || true
+}
+
+get_active_pid() {
+  if [[ -f "$STATE_FILE" ]]; then
+    jq -r '.pid // empty' "$STATE_FILE" 2>/dev/null || true
+  fi
+}
+
+is_active() {
+  local pid
+  pid=$(get_active_pid)
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  else
+    # Stale state file cleanup if process is gone
+    if [[ -f "$STATE_FILE" ]]; then
+      rm -f "$STATE_FILE"
+      rm -f "$OMARCHY_STAY_AWAKE"
+    fi
+    return 1
+  fi
+}
+
+stop_session() {
+  local silent="${1:-false}"
+  local pid
+  pid=$(get_active_pid)
+
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$STATE_FILE"
+  rm -f "$OMARCHY_STAY_AWAKE"
+
+  if [[ "$silent" != "true" ]]; then
+    notify "Amphetamine: Off" "Sleep and idle behavior restored."
+    echo "Amphetamine deactivated."
+  fi
+}
+
+start_session() {
+  local duration_str="${1:-indefinite}"
+  local duration_sec=0
+  local mode="indefinite"
+  local label="Indefinite"
+
+  case "$duration_str" in
+    indefinite|forever|inf|0)
+      duration_sec=0
+      mode="indefinite"
+      label="Indefinite"
+      ;;
+    *m)
+      local mins="${duration_str%m}"
+      duration_sec=$((mins * 60))
+      mode="timer"
+      label="${mins}m"
+      ;;
+    *h)
+      local hrs="${duration_str%h}"
+      duration_sec=$((hrs * 3600))
+      mode="timer"
+      label="${hrs}h"
+      ;;
+    *s)
+      local secs="${duration_str%s}"
+      duration_sec="$secs"
+      mode="timer"
+      label="${secs}s"
+      ;;
+    *)
+      if [[ "$duration_str" =~ ^[0-9]+$ ]]; then
+        duration_sec="$duration_str"
+        mode="timer"
+        label="${duration_sec}s"
+      else
+        echo "Error: invalid duration '$duration_str'. Use e.g. 15m, 30m, 1h, 2h, or indefinite." >&2
+        exit 1
+      fi
+      ;;
+  esac
+
+  # Clean up existing session silently first
+  stop_session true
+
+  local now
+  now=$(date +%s)
+  local expires_at=0
+  if [[ $duration_sec -gt 0 ]]; then
+    expires_at=$((now + duration_sec))
+  fi
+
+  mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
+  touch "$OMARCHY_STAY_AWAKE"
+
+  local inhibit_pid
+  if [[ $duration_sec -eq 0 ]]; then
+    systemd-inhibit --what=sleep:idle:handle-lid-switch \
+      --who="Amphetamine" \
+      --why="Amphetamine stay-awake session" \
+      sleep infinity >/dev/null 2>&1 &
+    inhibit_pid=$!
+  else
+    systemd-inhibit --what=sleep:idle:handle-lid-switch \
+      --who="Amphetamine" \
+      --why="Amphetamine stay-awake session (${label})" \
+      sleep "$duration_sec" >/dev/null 2>&1 &
+    inhibit_pid=$!
+
+    # Launch background watchdog to clean up and notify on expiration
+    (
+      tail --pid="$inhibit_pid" -f /dev/null 2>/dev/null
+      if [[ -f "$STATE_FILE" ]] && [[ "$(jq -r '.pid // 0' "$STATE_FILE" 2>/dev/null)" == "$inhibit_pid" ]]; then
+        rm -f "$STATE_FILE"
+        rm -f "$OMARCHY_STAY_AWAKE"
+        notify "Amphetamine: Expired" "Session ended (${label}). Normal sleep restored."
+      fi
+    ) >/dev/null 2>&1 &
+  fi
+
+  # Record state
+  cat <<JSON > "$STATE_FILE"
+{
+  "active": true,
+  "pid": $inhibit_pid,
+  "mode": "$mode",
+  "label": "$label",
+  "duration": $duration_sec,
+  "startedAt": $now,
+  "expiresAt": $expires_at
+}
+JSON
+
+  notify "Amphetamine: Active" "Sleep & lid-close suspend inhibited (${label})"
+  echo "Amphetamine active (${label}). PID: $inhibit_pid"
+}
+
+cycle_session() {
+  if ! is_active; then
+    start_session "indefinite"
+    return
+  fi
+
+  local current_label
+  current_label=$(jq -r '.label // "Indefinite"' "$STATE_FILE" 2>/dev/null || echo "Indefinite")
+
+  case "$current_label" in
+    Indefinite)
+      start_session "15m"
+      ;;
+    15m)
+      start_session "30m"
+      ;;
+    30m)
+      start_session "1h"
+      ;;
+    1h)
+      start_session "2h"
+      ;;
+    2h)
+      start_session "4h"
+      ;;
+    *)
+      stop_session false
+      ;;
+  esac
+}
+
+show_status() {
+  local json_mode="${1:-false}"
+
+  if is_active; then
+    if [[ "$json_mode" == "--json" ]]; then
+      local now
+      now=$(date +%s)
+      jq --argjson now "$now" '
+        . + {
+          "remaining": (if .expiresAt > 0 then ([0, (.expiresAt - $now)] | max) else 0 end)
+        }
+      ' "$STATE_FILE"
+    else
+      local label
+      label=$(jq -r '.label // "Indefinite"' "$STATE_FILE")
+      local expires_at
+      expires_at=$(jq -r '.expiresAt // 0' "$STATE_FILE")
+      if [[ $expires_at -gt 0 ]]; then
+        local now
+        now=$(date +%s)
+        local remaining=$((expires_at - now))
+        local rem_mins=$((remaining / 60))
+        echo "Amphetamine: Active (${label}, ~${rem_mins}m remaining)"
+      else
+        echo "Amphetamine: Active (Indefinite)"
+      fi
+    fi
+  else
+    if [[ "$json_mode" == "--json" ]]; then
+      echo '{"active":false,"mode":"off","label":"Off","duration":0,"remaining":0}'
+    else
+      echo "Amphetamine: Inactive"
+    fi
+  fi
+}
+
+run_command_wrapped() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: amphetamine run <command> [args...]" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
+  touch "$OMARCHY_STAY_AWAKE"
+  notify "Amphetamine: Command Running" "Lid & sleep inhibited for: $*"
+
+  set +e
+  systemd-inhibit --what=sleep:idle:handle-lid-switch \
+    --who="Amphetamine" \
+    --why="Running: $*" \
+    "$@"
+  local exit_code=$?
+  set -e
+
+  rm -f "$OMARCHY_STAY_AWAKE"
+  notify "Amphetamine: Command Finished" "Completed with exit code ${exit_code}. Normal sleep restored."
+  exit "$exit_code"
+}
+
+case "${1:-status}" in
+  on|start)
+    start_session "${2:-indefinite}"
+    ;;
+  off|stop)
+    stop_session false
+    ;;
+  toggle)
+    if is_active; then
+      stop_session false
+    else
+      start_session "indefinite"
+    fi
+    ;;
+  cycle)
+    cycle_session
+    ;;
+  status)
+    show_status "${2:-}"
+    ;;
+  run)
+    shift
+    run_command_wrapped "$@"
+    ;;
+  -h|--help|help)
+    cat <<EOF
+Usage: amphetamine <command> [arguments]
+
+Commands:
+  on [duration]   Keep system awake (e.g. 15m, 30m, 1h, 2h, indefinite)
+  off             Deactivate and restore normal sleep behavior
+  toggle          Toggle between Indefinite and Off
+  cycle           Cycle presets (Off -> Indefinite -> 15m -> 30m -> 1h -> 2h -> Off)
+  status [--json] Print current active state
+  run <cmd...>    Inhibit lid & sleep for the duration of <cmd>
+EOF
+    ;;
+  *)
+    echo "Unknown command '$1'. Run 'amphetamine --help' for usage." >&2
+    exit 1
+    ;;
+esac

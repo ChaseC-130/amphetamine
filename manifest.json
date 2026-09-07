@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "chase.amphetamine",
+  "name": "Amphetamine",
+  "version": "1.0.0",
+  "author": "Chase",
+  "license": "MIT",
+  "description": "Keep your system awake and prevent sleep when closing your laptop lid in Omarchy.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Amphetamine.qml"
+  },
+  "barWidget": {
+    "displayName": "Amphetamine",
+    "description": "Prevent sleep, idle screensaver, and lid-close suspend for long tasks and AI agents.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
