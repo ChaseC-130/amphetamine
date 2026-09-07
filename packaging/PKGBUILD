@@ -5,7 +5,7 @@
 # then test with `makepkg -si` before pushing to aur.archlinux.org.
 
 pkgname=amphetamine
-pkgver=2.0.0
+pkgver=2.0.1
 pkgrel=1
 pkgdesc="Keep Linux awake with the laptop lid closed, and power the internal display down while it is shut"
 arch=('any')

@@ -11,7 +11,7 @@
 set -euo pipefail
 
 readonly APP_NAME="Amphetamine"
-readonly APP_VERSION="2.0.0"
+readonly APP_VERSION="2.0.1"
 readonly APP_GLYPH="󰛊"
 
 readonly STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -24,6 +24,10 @@ readonly DISPLAY_OFF_FLAG="$STATE_DIR/display-off"
 # Same idea for Omarchy's idle indicator: only release what we acquired.
 readonly STAY_AWAKE_FLAG="$STATE_DIR/stay-awake-owned"
 readonly OMARCHY_STAY_AWAKE="$STATE_HOME/omarchy/indicators/stay-awake"
+# Serializes the mutating paths. The bar widget and the CLI drive the same
+# state file, and a start racing a stop can otherwise reap the very session it
+# just wrote.
+readonly LOCK_FILE="$STATE_DIR/.lock"
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SELF
@@ -39,6 +43,19 @@ die() {
 
 require_jq() {
   command -v jq >/dev/null 2>&1 || die "jq is required but not installed (try: omarchy pkg add jq)"
+}
+
+# Held for the life of the calling process; re-locking an fd we already own is
+# a no-op, so nested callers (start_session -> stop_session) are safe. Best
+# effort: without flock we simply fall back to the unsynchronized path.
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$STATE_DIR" || return 0
+  # The braces matter: a redirection on a bare `exec` applies to the shell for
+  # the rest of its life, so `exec 9>... 2>/dev/null` would silently discard
+  # every error message this script goes on to print.
+  { exec 9>"$LOCK_FILE"; } 2>/dev/null || return 0
+  flock -w 10 9 2>/dev/null || return 0
 }
 
 # ---------------------------------------------------------------- config
@@ -74,10 +91,17 @@ init_config() {
 }
 
 backfill_config() {
+  local merged
+  merged=$(jq -s '.[0] * .[1]' <(config_defaults) "$CONFIG_FILE" 2>/dev/null) || return 0
+
+  # Only rewrite when a key is genuinely missing. The bar widget watches this
+  # file, and rewriting it on every read would retrigger that watcher — and
+  # bump its mtime — for a file whose contents did not change.
+  jq -e --argjson merged "$merged" '. == $merged' "$CONFIG_FILE" >/dev/null 2>&1 && return 0
+
   local tmp
   tmp=$(mktemp "$STATE_DIR/.config.XXXXXX")
-  jq -s '.[0] * .[1]' <(config_defaults) "$CONFIG_FILE" >"$tmp" \
-    && mv "$tmp" "$CONFIG_FILE" || rm -f "$tmp"
+  printf '%s\n' "$merged" >"$tmp" && mv "$tmp" "$CONFIG_FILE" || rm -f "$tmp"
 }
 
 # v1 spelled two of these differently, and one of them inverted. Rewrite them
@@ -100,11 +124,18 @@ migrate_config() {
 
 # Order matters: a v1 key has to be rewritten into its v2 spelling before the
 # backfill lands a default on top of the question it already answered.
+#
+# Memoized: every config_raw call routes through here, and re-running the
+# create/migrate/backfill trio per lookup cost four jq spawns a time — 27 of
+# them for a single `capabilities`, which the bar widget polls while open.
+config_ready_done=0
 config_ready() {
+  (( config_ready_done )) && return 0
   require_jq
   init_config
   migrate_config
   backfill_config
+  config_ready_done=1
 }
 
 config_raw() {
@@ -384,8 +415,10 @@ is_active() {
   local pid
   pid=$(session_pid)
   [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && return 0
-  # Stale file: the session died without cleaning up after itself.
-  [[ -f $STATE_FILE ]] && reap_stale
+  # Stale file: the session died without cleaning up after itself. Re-read
+  # before deleting -- a concurrent `on` may have replaced the file since the
+  # read above, and reaping that would orphan a session that is very much alive.
+  [[ -f $STATE_FILE && $(session_pid) == "$pid" ]] && reap_stale
   return 1
 }
 
@@ -444,6 +477,10 @@ current_pgid() {
 # holds the whole session: the inhibitor lives exactly as long as this loop.
 cmd_session() {
   local duration_sec="$1"
+  # start_session already closes fd 9 on the launch line so neither setsid nor
+  # systemd-inhibit inherits the lock; drop any stray copy here too, because a
+  # session that held it would block every later call for the flock timeout.
+  exec 9>&- 2>/dev/null || true
   local pgid
   pgid=$(current_pgid)
   [[ $pgid =~ ^[0-9]+$ ]] || die "could not determine process group"
@@ -499,6 +536,7 @@ session_cleanup() {
 
 start_session() {
   local requested="${1:-}" quiet="${2:-}"
+  acquire_lock
   config_ready
 
   [[ -n $requested ]] || requested=$(config_raw defaultDuration indefinite)
@@ -524,7 +562,7 @@ start_session() {
     --what="$what" \
     --who="$APP_NAME" \
     --why="Keep awake ($title)" \
-    "$SELF" __session "$duration_sec" </dev/null >/dev/null 2>&1 &
+    "$SELF" __session "$duration_sec" </dev/null >/dev/null 2>&1 9>&- &
 
   # The session process writes the state file itself; wait for it to appear so
   # callers (and the bar widget) never observe a half-started session.
@@ -549,6 +587,7 @@ start_session() {
 
 stop_session() {
   local quiet="${1:-}"
+  acquire_lock
   local pid
   pid=$(session_pid)
 

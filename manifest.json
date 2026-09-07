@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "chase.amphetamine",
   "name": "Amphetamine",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "Chase Cargill",
   "license": "MIT",
   "description": "Amphetamine for Omarchy: keep the system awake with the laptop lid closed, and power the internal display down while it is shut.",

@@ -81,7 +81,7 @@ Panel {
   function tooltip() {
     if (!sessionActive) return "Amphetamine — off\nClick for durations · right-click to keep awake"
     var head = sessionMode === "timer"
-      ? "Amphetamine — " + formatRemaining(remainingSec) + " remaining"
+      ? "Amphetamine — " + sessionTitle + " session, " + formatRemaining(remainingSec) + " remaining"
       : "Amphetamine — awake indefinitely"
     if (lidControlAvailable && displayOffOnLidClose)
       head += "\nScreen powers down when you close the lid"
