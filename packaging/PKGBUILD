@@ -19,7 +19,7 @@ optdepends=(
 )
 provides=('omarchy-amphetamine')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('804d6ed7d2e949bcdf64a64030b4f270e68a3191c7364120ac9c6b92e2752798')
 
 package() {
   cd "$srcdir/$pkgname-$pkgver"
