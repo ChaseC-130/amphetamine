@@ -1,20 +1,76 @@
 #!/usr/bin/env bash
 
-# Amphetamine for Omarchy
+# Amphetamine for Omarchy & Linux
 # Prevents system sleep, idle screensaver, and lid-close suspend.
 
 set -euo pipefail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/amphetamine"
 STATE_FILE="$STATE_DIR/state.json"
+CONFIG_FILE="$STATE_DIR/config.json"
 OMARCHY_STAY_AWAKE="$HOME/.local/state/omarchy/indicators/stay-awake"
 
 mkdir -p "$STATE_DIR"
 
+# Initialize config with defaults if missing
+init_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat << 'JSON' > "$CONFIG_FILE"
+{
+  "allowDisplaySleep": false,
+  "turnOffDisplayOnLidClose": true,
+  "defaultDuration": "indefinite",
+  "notifications": true
+}
+JSON
+  fi
+}
+
+get_config() {
+  local key="$1"
+  local fallback="${2:-}"
+  init_config
+  local val
+  val=$(jq -r --arg k "$key" '.[$k] // empty' "$CONFIG_FILE" 2>/dev/null || true)
+  if [[ -z "$val" ]]; then
+    echo "$fallback"
+  else
+    echo "$val"
+  fi
+}
+
+set_config() {
+  local key="$1"
+  local raw_val="$2"
+  init_config
+
+  # Parse boolean/number vs string
+  local parsed_val
+  if [[ "$raw_val" == "true" || "$raw_val" == "false" ]]; then
+    parsed_val="$raw_val"
+  elif [[ "$raw_val" =~ ^[0-9]+$ ]]; then
+    parsed_val="$raw_val"
+  else
+    parsed_val="\"$raw_val\""
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson v "$parsed_val" --arg k "$key" '.[$k] = $v' "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "Config updated: $key = $raw_val"
+}
+
 notify() {
   local title="$1"
   local msg="$2"
-  notify-send -a "Amphetamine" -i "preferences-system-power" "$title" "$msg" 2>/dev/null || true
+  local notifications_enabled
+  notifications_enabled=$(get_config "notifications" "true")
+  if [[ "$notifications_enabled" == "true" ]]; then
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -a "Amphetamine" -i "preferences-system-power" "$title" "$msg" 2>/dev/null || true
+    fi
+  fi
 }
 
 get_active_pid() {
@@ -29,13 +85,21 @@ is_active() {
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     return 0
   else
-    # Stale state file cleanup if process is gone
     if [[ -f "$STATE_FILE" ]]; then
       rm -f "$STATE_FILE"
       rm -f "$OMARCHY_STAY_AWAKE"
     fi
     return 1
   fi
+}
+
+is_laptop() {
+  if command -v omarchy-hw-laptop-closed >/dev/null 2>&1; then
+    return 0
+  elif [[ -d /proc/acpi/button/lid ]] || compgen -G "/sys/class/power_supply/BAT*" >/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 stop_session() {
@@ -58,7 +122,11 @@ stop_session() {
 }
 
 start_session() {
-  local duration_str="${1:-indefinite}"
+  local duration_str="${1:-}"
+  if [[ -z "$duration_str" ]]; then
+    duration_str=$(get_config "defaultDuration" "indefinite")
+  fi
+
   local duration_sec=0
   local mode="indefinite"
   local label="Indefinite"
@@ -99,7 +167,6 @@ start_session() {
       ;;
   esac
 
-  # Clean up existing session silently first
   stop_session true
 
   local now
@@ -109,24 +176,32 @@ start_session() {
     expires_at=$((now + duration_sec))
   fi
 
-  mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
-  touch "$OMARCHY_STAY_AWAKE"
+  local allow_display_sleep
+  allow_display_sleep=$(get_config "allowDisplaySleep" "false")
+  local turnoff_lid
+  turnoff_lid=$(get_config "turnOffDisplayOnLidClose" "true")
+
+  local inhibit_what="sleep:handle-lid-switch"
+  if [[ "$allow_display_sleep" == "false" ]]; then
+    inhibit_what="sleep:idle:handle-lid-switch"
+    mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
+    touch "$OMARCHY_STAY_AWAKE"
+  fi
 
   local inhibit_pid
   if [[ $duration_sec -eq 0 ]]; then
-    systemd-inhibit --what=sleep:idle:handle-lid-switch \
+    systemd-inhibit --what="$inhibit_what" \
       --who="Amphetamine" \
       --why="Amphetamine stay-awake session" \
       sleep infinity >/dev/null 2>&1 &
     inhibit_pid=$!
   else
-    systemd-inhibit --what=sleep:idle:handle-lid-switch \
+    systemd-inhibit --what="$inhibit_what" \
       --who="Amphetamine" \
       --why="Amphetamine stay-awake session (${label})" \
       sleep "$duration_sec" >/dev/null 2>&1 &
     inhibit_pid=$!
 
-    # Launch background watchdog to clean up and notify on expiration
     (
       tail --pid="$inhibit_pid" -f /dev/null 2>/dev/null
       if [[ -f "$STATE_FILE" ]] && [[ "$(jq -r '.pid // 0' "$STATE_FILE" 2>/dev/null)" == "$inhibit_pid" ]]; then
@@ -137,7 +212,6 @@ start_session() {
     ) >/dev/null 2>&1 &
   fi
 
-  # Record state
   cat <<JSON > "$STATE_FILE"
 {
   "active": true,
@@ -145,12 +219,19 @@ start_session() {
   "mode": "$mode",
   "label": "$label",
   "duration": $duration_sec,
+  "allowDisplaySleep": $allow_display_sleep,
+  "turnOffDisplayOnLidClose": $turnoff_lid,
   "startedAt": $now,
   "expiresAt": $expires_at
 }
 JSON
 
-  notify "Amphetamine: Active" "Sleep & lid-close suspend inhibited (${label})"
+  local extra_msg="Sleep & lid suspend inhibited (${label})"
+  if [[ "$allow_display_sleep" == "true" ]]; then
+    extra_msg="Sleep & lid inhibited, display sleep allowed (${label})"
+  fi
+
+  notify "Amphetamine: Active" "$extra_msg"
   echo "Amphetamine active (${label}). PID: $inhibit_pid"
 }
 
@@ -202,14 +283,21 @@ show_status() {
       label=$(jq -r '.label // "Indefinite"' "$STATE_FILE")
       local expires_at
       expires_at=$(jq -r '.expiresAt // 0' "$STATE_FILE")
+      local disp_sleep
+      disp_sleep=$(jq -r '.allowDisplaySleep // false' "$STATE_FILE")
+      local suffix=""
+      if [[ "$disp_sleep" == "true" ]]; then
+        suffix=" [Display sleep allowed]"
+      fi
+
       if [[ $expires_at -gt 0 ]]; then
         local now
         now=$(date +%s)
         local remaining=$((expires_at - now))
         local rem_mins=$((remaining / 60))
-        echo "Amphetamine: Active (${label}, ~${rem_mins}m remaining)"
+        echo "Amphetamine: Active (${label}, ~${rem_mins}m remaining)$suffix"
       else
-        echo "Amphetamine: Active (Indefinite)"
+        echo "Amphetamine: Active (Indefinite)$suffix"
       fi
     fi
   else
@@ -221,18 +309,44 @@ show_status() {
   fi
 }
 
+show_info() {
+  init_config
+  echo "=== Amphetamine System Diagnostics ==="
+  echo "OS: $(uname -s) $(uname -r)"
+  echo "Init System: $(pidof systemd >/dev/null && echo "systemd" || echo "other")"
+  echo "systemd-inhibit: $(command -v systemd-inhibit >/dev/null && echo "available" || echo "missing")"
+  echo "Laptop Hardware: $(is_laptop && echo "yes" || echo "no/desktop")"
+  echo "Compositor: ${XDG_CURRENT_DESKTOP:-unknown} (${WAYLAND_DISPLAY:-X11})"
+  echo "Hyprland (hyprctl): $(command -v hyprctl >/dev/null && echo "available" || echo "not found")"
+  echo "Omarchy Shell: $(pgrep -f "omarchy-shell" >/dev/null && echo "running" || echo "not running")"
+  echo "Notification Daemon: $(command -v notify-send >/dev/null && echo "available" || echo "missing")"
+  echo ""
+  echo "=== Current Configuration ==="
+  cat "$CONFIG_FILE"
+  echo ""
+  echo "=== Active Session ==="
+  show_status
+}
+
 run_command_wrapped() {
   if [[ $# -eq 0 ]]; then
     echo "Usage: amphetamine run <command> [args...]" >&2
     exit 1
   fi
 
-  mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
-  touch "$OMARCHY_STAY_AWAKE"
+  local allow_display_sleep
+  allow_display_sleep=$(get_config "allowDisplaySleep" "false")
+  local inhibit_what="sleep:handle-lid-switch"
+  if [[ "$allow_display_sleep" == "false" ]]; then
+    inhibit_what="sleep:idle:handle-lid-switch"
+    mkdir -p "$(dirname "$OMARCHY_STAY_AWAKE")"
+    touch "$OMARCHY_STAY_AWAKE"
+  fi
+
   notify "Amphetamine: Command Running" "Lid & sleep inhibited for: $*"
 
   set +e
-  systemd-inhibit --what=sleep:idle:handle-lid-switch \
+  systemd-inhibit --what="$inhibit_what" \
     --who="Amphetamine" \
     --why="Running: $*" \
     "$@"
@@ -246,7 +360,7 @@ run_command_wrapped() {
 
 case "${1:-status}" in
   on|start)
-    start_session "${2:-indefinite}"
+    start_session "${2:-}"
     ;;
   off|stop)
     stop_session false
@@ -255,7 +369,7 @@ case "${1:-status}" in
     if is_active; then
       stop_session false
     else
-      start_session "indefinite"
+      start_session ""
     fi
     ;;
   cycle)
@@ -263,6 +377,31 @@ case "${1:-status}" in
     ;;
   status)
     show_status "${2:-}"
+    ;;
+  config)
+    case "${2:-list}" in
+      set)
+        if [[ $# -lt 4 ]]; then
+          echo "Usage: amphetamine config set <key> <value>" >&2
+          exit 1
+        fi
+        set_config "$3" "$4"
+        ;;
+      get)
+        get_config "$3"
+        ;;
+      list|show)
+        init_config
+        cat "$CONFIG_FILE"
+        ;;
+      *)
+        echo "Usage: amphetamine config [get <key>|set <key> <val>|list]" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  info|doctor)
+    show_info
     ;;
   run)
     shift
@@ -272,13 +411,19 @@ case "${1:-status}" in
     cat <<EOF
 Usage: amphetamine <command> [arguments]
 
-Commands:
-  on [duration]   Keep system awake (e.g. 15m, 30m, 1h, 2h, indefinite)
-  off             Deactivate and restore normal sleep behavior
-  toggle          Toggle between Indefinite and Off
-  cycle           Cycle presets (Off -> Indefinite -> 15m -> 30m -> 1h -> 2h -> Off)
-  status [--json] Print current active state
-  run <cmd...>    Inhibit lid & sleep for the duration of <cmd>
+Session Commands:
+  on [duration]      Keep system awake (e.g. 15m, 30m, 1h, 2h, 4h, indefinite)
+  off                Deactivate and restore normal sleep behavior
+  toggle             Toggle between active and inactive
+  cycle              Cycle presets (Off -> Indefinite -> 15m -> 30m -> 1h -> 2h -> Off)
+  status [--json]    Print current active state
+  run <cmd...>       Inhibit lid & sleep for the duration of <cmd>
+
+Configuration:
+  config list        View current settings
+  config set <k> <v> Set configuration (e.g. allowDisplaySleep true, turnOffDisplayOnLidClose false)
+  config get <key>   Get configuration value
+  info               Show system diagnostics and device compatibility
 EOF
     ;;
   *)
